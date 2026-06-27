@@ -138,9 +138,11 @@ async function runPipeline(tabId: number, audioBase64: string, mimeType: string)
     // Stage 1: Transcribe audio, scrape DOM, and scrape URL in parallel
     sendToTab(tabId, { action: 'bubble-state', state: 'transcribing' });
 
-    // Fetch API keys — hardcoded fallbacks for development (remove before publishing)
+    // Fetch API keys. STT/TTS keys live in the extension Settings (chrome.storage),
+    // never hardcoded. If the ElevenLabs key is unset, transcription falls back to
+    // the other configured providers.
     const storedKeys = await getApiKeys();
-    const elevenLabsKey = storedKeys.elevenLabsKey || 'sk_24b972795801eff525abd90dbb8efc3f3d633fef0120ddd8';
+    const elevenLabsKey = storedKeys.elevenLabsKey || '';
     const groqKey = storedKeys.groqKey;
     const deepgramKey = storedKeys.deepgramKey;
 
