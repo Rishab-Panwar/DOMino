@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DOMino, Voice-Driven Browser Agent</title>
+  <meta name="description" content="Speak a command and DOMino operates your browser for you, clicks, types, navigates, completes whole tasks. A chain of actions that fall into place." />
+  <link rel="icon" href="logo.png" type="image/png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0a0b10;
+      --bg-2: #11131c;
+      --surface: #161925;
+      --line: rgba(255,255,255,0.08);
+      --text: #f3f4f8;
+      --muted: #9aa0b4;
+      --tile: #f4f1ea;
+      --tile-ink: #14151c;
+      --accent: #ffb020;       /* domino-dot amber */
+      --accent-2: #5b8cff;     /* electric blue */
+      --radius: 16px;
+      --max: 1140px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+    h1, h2, h3, .display { font-family: 'Space Grotesk', sans-serif; letter-spacing: -0.02em; }
+    a { color: inherit; text-decoration: none; }
+    .wrap { width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 24px; }
+    .accent { color: var(--accent); }
+    .grad-text {
+      background: linear-gradient(100deg, #fff 10%, var(--accent) 55%, var(--accent-2) 100%);
+      -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    }
+
+    /* Ambient background */
+    .bg-glow {
+      position: fixed; inset: 0; z-index: -2; pointer-events: none;
+      background:
+        radial-gradient(700px 500px at 80% -5%, rgba(91,140,255,0.16), transparent 60%),
+        radial-gradient(640px 460px at 10% 8%, rgba(255,176,32,0.12), transparent 60%);
+    }
+    .bg-grid {
+      position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: 0.4;
+      background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 48px 48px;
+      -webkit-mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 70%);
+      mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 70%);
+    }
+
+    /* Nav */
+    header {
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(14px);
+      background: rgba(10,11,16,0.7);
+      border-bottom: 1px solid var(--line);
+    }
+    .nav { display: flex; align-items: center; justify-content: space-between; height: 66px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-family: 'Space Grotesk'; font-weight: 700; font-size: 20px; }
+    .brand img { height: 30px; width: auto; }
+    .brand b { color: var(--accent); }
+    .nav-links { display: flex; align-items: center; gap: 28px; }
+    .nav-links a:not(.btn) { color: var(--muted); font-size: 14.5px; font-weight: 500; transition: color .2s; }
+    .nav-links a:not(.btn):hover { color: var(--text); }
+    .btn {
+      display: inline-flex; align-items: center; gap: 9px; font-weight: 600; font-size: 14.5px;
+      padding: 11px 20px; border-radius: 11px; cursor: pointer; border: 1px solid transparent;
+      transition: transform .15s ease, box-shadow .2s ease, background .2s;
+    }
+    .btn-primary { background: var(--accent); color: #000; box-shadow: 0 8px 28px rgba(255,176,32,0.28); }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 34px rgba(255,176,32,0.4); }
+    .btn-ghost { background: rgba(255,255,255,0.05); color: var(--text); border-color: var(--line); }
+    .btn-ghost:hover { background: rgba(255,255,255,0.1); transform: translateY(-2px); }
+    @media (max-width: 720px){ .nav-links a:not(.btn){ display:none; } }
+
+    /* Hero */
+    .hero { padding: 92px 0 40px; position: relative; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600;
+      color: var(--muted); background: rgba(255,255,255,0.04); border: 1px solid var(--line);
+      padding: 7px 14px; border-radius: 999px; margin-bottom: 26px;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+    .hero h1 { font-size: clamp(40px, 7vw, 76px); font-weight: 700; line-height: 1.02; }
+    .hero .sub { color: var(--muted); font-size: clamp(16px, 2.2vw, 20px); max-width: 620px; margin: 24px 0 34px; }
+    .hero-cta { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+    .hint { color: var(--muted); font-size: 13.5px; display: flex; align-items: center; gap: 8px; }
+    kbd {
+      font-family: 'Space Grotesk'; background: var(--surface); border: 1px solid var(--line);
+      border-bottom-width: 2px; border-radius: 6px; padding: 2px 8px; font-size: 13px; color: var(--text);
+    }
+
+    /* Falling dominoes strip */
+    .domino-strip { display: flex; gap: 14px; align-items: flex-end; height: 78px; margin: 46px 0 6px; }
+    .tile {
+      width: 22px; height: 64px; background: var(--tile); border-radius: 6px;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.45); position: relative; transform-origin: bottom left;
+      animation: topple 2.6s ease-in-out infinite;
+    }
+    .tile::before { content:""; position:absolute; left:4px; right:4px; top:50%; height:2px; background: rgba(20,21,28,0.25); transform: translateY(-50%); }
+    .tile::after {
+      content:""; position:absolute; left:50%; top:24%; width:6px; height:6px; border-radius:50%;
+      background: var(--tile-ink); transform: translateX(-50%);
+      box-shadow: 0 16px 0 var(--tile-ink);
+    }
+    .tile:nth-child(1){ animation-delay: 0s; } .tile:nth-child(2){ animation-delay: .16s; }
+    .tile:nth-child(3){ animation-delay: .32s; } .tile:nth-child(4){ animation-delay: .48s; }
+    .tile:nth-child(5){ animation-delay: .64s; } .tile:nth-child(6){ animation-delay: .80s; }
+    .tile:nth-child(7){ animation-delay: .96s; } .tile:nth-child(8){ animation-delay: 1.12s; }
+    .tile.amber{ background: var(--accent); } .tile.amber::after{ background:#1a1205; box-shadow:0 16px 0 #1a1205; } .tile.amber::before{ background: rgba(26,18,5,0.3); }
+    @keyframes topple {
+      0%, 8% { transform: rotate(0deg); }
+      26% { transform: rotate(74deg); }
+      60%, 100% { transform: rotate(0deg); }
+    }
+    @media (prefers-reduced-motion: reduce){ .tile{ animation: none; } }
+
+    /* Demo video */
+    .demo {
+      margin-top: 26px; border-radius: 22px; overflow: hidden; border: 1px solid var(--line);
+      background: var(--bg-2); box-shadow: 0 40px 120px rgba(0,0,0,0.55); position: relative;
+    }
+    .demo-bar { display: flex; align-items: center; gap: 7px; padding: 13px 16px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,0.02); }
+    .demo-bar i { width: 11px; height: 11px; border-radius: 50%; background: #2c2f3c; display: inline-block; }
+    .demo-bar i:nth-child(1){ background:#ff5f57; } .demo-bar i:nth-child(2){ background:#febc2e; } .demo-bar i:nth-child(3){ background:#28c840; }
+    .demo-bar span { margin-left: 10px; color: var(--muted); font-size: 12.5px; }
+    .demo video { width: 100%; display: block; }
+
+    /* Sections */
+    section { padding: 84px 0; }
+    .eyebrow { color: var(--accent); font-weight: 600; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; }
+    .sec-title { font-size: clamp(28px, 4.5vw, 44px); font-weight: 700; margin: 12px 0 14px; }
+    .sec-lead { color: var(--muted); max-width: 620px; font-size: 17px; }
+    .center { text-align: center; } .center .sec-lead { margin: 0 auto; }
+
+    /* steps */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 48px; }
+    .step {
+      background: linear-gradient(180deg, var(--surface), var(--bg-2));
+      border: 1px solid var(--line); border-radius: var(--radius); padding: 28px 24px; position: relative;
+      transition: transform .25s, border-color .25s;
+    }
+    .step:hover { transform: translateY(-5px); border-color: rgba(255,176,32,0.4); }
+    .step .num {
+      font-family: 'Space Grotesk'; font-weight: 700; font-size: 14px; color: #1a1205;
+      width: 34px; height: 34px; border-radius: 9px; background: var(--accent);
+      display: grid; place-items: center; margin-bottom: 18px;
+    }
+    .step h3 { font-size: 20px; margin-bottom: 9px; }
+    .step p { color: var(--muted); font-size: 15px; }
+    .step .arrow { position: absolute; right: -22px; top: 50%; transform: translateY(-50%); color: var(--line); font-size: 26px; z-index: 2; }
+    .step:last-child .arrow { display: none; }
+
+    /* features */
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 48px; }
+    .card {
+      background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+      padding: 26px 22px; transition: transform .25s, border-color .25s, background .25s;
+    }
+    .card:hover { transform: translateY(-4px); border-color: rgba(91,140,255,0.4); background: #1a1e2c; }
+    .card .ic { width: 44px; height: 44px; border-radius: 11px; display: grid; place-items: center; font-size: 22px; background: rgba(255,176,32,0.12); margin-bottom: 16px; }
+    .card h3 { font-size: 17.5px; margin-bottom: 7px; }
+    .card p { color: var(--muted); font-size: 14.5px; }
+
+    /* powered by */
+    .stack { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 40px; }
+    .chip {
+      display: flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 14px;
+      background: var(--surface); border: 1px solid var(--line); font-weight: 600; font-size: 15px;
+    }
+    .chip .d { width: 9px; height: 9px; border-radius: 50%; }
+
+    /* walkthrough video */
+    .vid-frame {
+      margin-top: 44px; border-radius: 20px; overflow: hidden; border: 1px solid var(--line);
+      box-shadow: 0 30px 90px rgba(0,0,0,0.5); background:#000;
+    }
+    .vid-frame video { width: 100%; display: block; }
+
+    /* CTA */
+    .cta {
+      text-align: center; border-radius: 28px; padding: 70px 28px; position: relative; overflow: hidden;
+      border: 1px solid var(--line);
+      background:
+        radial-gradient(600px 300px at 50% 0%, rgba(255,176,32,0.16), transparent 60%),
+        linear-gradient(180deg, var(--surface), var(--bg-2));
+    }
+    .cta h2 { font-size: clamp(30px, 5vw, 50px); }
+    .cta p { color: var(--muted); max-width: 540px; margin: 16px auto 30px; font-size: 17px; }
+
+    footer { border-top: 1px solid var(--line); padding: 40px 0; color: var(--muted); }
+    .foot { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; font-size: 14px; }
+    .foot .brand { font-size: 18px; }
+
+    /* reveal */
+    .reveal { opacity: 0; transform: translateY(24px); transition: opacity .7s ease, transform .7s ease; }
+    .reveal.in { opacity: 1; transform: none; }
+
+    @media (max-width: 860px){ .steps, .grid { grid-template-columns: 1fr; } .step .arrow{ display:none; } }
+  </style>
+</head>
+<body>
+  <div class="bg-glow"></div>
+  <div class="bg-grid"></div>
+
+  <!-- Nav -->
+  <header>
+    <div class="wrap nav">
+      <a class="brand" href="#top"><img src="logo.png" alt="DOMino logo" /> DOM<b>ino</b></a>
+      <nav class="nav-links">
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+        <a class="btn btn-primary" href="https://github.com/Rishab-Panwar/DOMino.git" target="_blank" rel="noopener">Get DOMino</a>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Hero -->
+  <main id="top">
+    <section class="hero">
+      <div class="wrap">
+        <span class="pill"><span class="dot"></span> Voice-driven browser agent</span>
+        <h1>Say it.<br><span class="grad-text">Watch it fall into place.</span></h1>
+        <p class="sub">DOMino turns your voice into browser actions. Hold a key, speak a command, and an AI agent <b>sees your screen</b>, reasons about what to do, and <b>does it</b>, clicking, typing, navigating, and finishing whole tasks. One word topples the whole chain.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="#how">See how it works</a>
+          <span class="hint">Hold <kbd>Enter</kbd> and speak</span>
+        </div>
+
+        <div class="domino-strip" aria-hidden="true">
+          <div class="tile"></div><div class="tile"></div><div class="tile"></div>
+          <div class="tile amber"></div><div class="tile"></div><div class="tile"></div>
+          <div class="tile"></div><div class="tile"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- The name -->
+    <section style="padding-top:24px">
+      <div class="wrap center">
+        <div class="reveal" style="max-width:760px;margin:0 auto;border:1px solid var(--line);border-radius:22px;padding:38px 30px;background:linear-gradient(180deg,var(--surface),var(--bg-2));position:relative;overflow:hidden">
+          <span class="eyebrow">Why the name?</span>
+          <h2 class="sec-title" style="margin-bottom:18px"><span class="grad-text">DOM</span>ino</h2>
+          <p style="font-size:clamp(16px,2.4vw,21px);color:var(--text);line-height:1.6;max-width:600px;margin:0 auto">
+            <b class="accent">DOM</b>, the Document Object Model, the structure of every web page DOMino reads and operates on directly.<br/><br/>
+            <b class="accent">Domino</b>, one spoken command topples a whole chain of actions that fall into place, exactly like a line of dominoes.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- How it works -->
+    <section id="how">
+      <div class="wrap">
+        <div class="reveal">
+          <span class="eyebrow">How it works</span>
+          <h2 class="sec-title">Three tiles. One chain reaction.</h2>
+          <p class="sec-lead">No clicking, no typing, no hunting through menus. You speak, DOMino handles the rest in a tight observe &rarr; reason &rarr; act loop.</p>
+        </div>
+        <div class="steps">
+          <div class="step reveal">
+            <div class="num">1</div>
+            <h3>Speak</h3>
+            <p>Hold <b>Enter</b> and say what you want, &ldquo;search YouTube and play some lofi,&rdquo; &ldquo;compose an email to Sam about the meeting.&rdquo; Your voice is transcribed in real time.</p>
+            <div class="arrow">&rarr;</div>
+          </div>
+          <div class="step reveal">
+            <div class="num">2</div>
+            <h3>It sees</h3>
+            <p>DOMino captures your screen and reads the page, every button, field, and link as a numbered map. It knows exactly what&rsquo;s actionable.</p>
+            <div class="arrow">&rarr;</div>
+          </div>
+          <div class="step reveal">
+            <div class="num">3</div>
+            <h3>It acts</h3>
+            <p>The AI picks the next move and executes it on the real page, re-checking after each step, until the whole task is done. Hands-free.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section id="features" style="background:linear-gradient(180deg,transparent,rgba(255,255,255,0.015),transparent)">
+      <div class="wrap">
+        <div class="reveal">
+          <span class="eyebrow">What it does</span>
+          <h2 class="sec-title">An agent for the whole web.</h2>
+          <p class="sec-lead">DOMino isn&rsquo;t scripted for a few sites, it works on virtually any website, because it acts on the page itself.</p>
+        </div>
+        <div class="grid">
+          <div class="card reveal"><div class="ic">&#128483;&#65039;</div><h3>Voice to action</h3><p>Hold a key, speak, release. Natural commands become real browser actions, no syntax to learn.</p></div>
+          <div class="card reveal"><div class="ic">&#128065;&#65039;</div><h3>Sees your screen</h3><p>Multimodal: a screenshot plus a structured map of every interactive element. It reads the page like you do.</p></div>
+          <div class="card reveal"><div class="ic">&#9881;&#65039;</div><h3>Autonomous loop</h3><p>Re-observes after every action and decides the next step on its own, up to a full multi-step task.</p></div>
+          <div class="card reveal"><div class="ic">&#127760;</div><h3>Any website</h3><p>Search, shop, fill forms, compose email, navigate between sites. If it&rsquo;s on the web, DOMino can drive it.</p></div>
+          <div class="card reveal"><div class="ic">&#128266;</div><h3>Speaks back</h3><p>Natural voice readback tells you what it&rsquo;s doing and answers questions about the page out loud.</p></div>
+          <div class="card reveal"><div class="ic">&#128172;</div><h3>Multi-turn</h3><p>Ask follow-ups, correct it, or chain requests, DOMino keeps the context per tab.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Powered by -->
+    <section id="stack">
+      <div class="wrap center">
+        <div class="reveal">
+          <span class="eyebrow">Under the hood</span>
+          <h2 class="sec-title">Powered by best-in-class AI.</h2>
+          <p class="sec-lead">A multimodal brain for reasoning, plus specialized engines for voice and page understanding. The reasoning model is pluggable, swap it with one setting.</p>
+        </div>
+        <div class="stack reveal">
+          <span class="chip"><span class="d" style="background:#ffb020"></span> Google Gemini via Vertex AI, reasoning + vision</span>
+          <span class="chip"><span class="d" style="background:#5b8cff"></span> ElevenLabs, voice in &amp; out</span>
+          <span class="chip"><span class="d" style="background:#ff6b35"></span> Firecrawl, page understanding</span>
+          <span class="chip"><span class="d" style="background:#28c840"></span> Chrome MV3, runs on any site</span>
+          <span class="chip"><span class="d" style="background:#9aa0b4"></span> &#128274; Runs locally, your keys stay on your machine</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA -->
+    <section>
+      <div class="wrap">
+        <div class="cta reveal">
+          <h2 class="grad-text">Tip the first domino.</h2>
+          <p>DOMino runs entirely on your own machine, a local backend plus the extension in your browser, so your keys and data never leave your computer. Install it, open any website, hold <b>Enter</b>, and speak.</p>
+          <a class="btn btn-primary" href="https://github.com/Rishab-Panwar/DOMino.git" target="_blank" rel="noopener">Get DOMino on GitHub &rarr;</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap foot">
+      <a class="brand" href="#top"><img src="logo.png" alt="DOMino logo" style="height:24px;width:auto" /> DOM<b style="color:var(--accent)">ino</b></a>
+      <span>Say it. Watch it fall into place.</span>
+      <span>&copy; 2026 DOMino &middot; MIT Licensed</span>
+    </div>
+  </footer>
+
+  <script>
+    // Scroll reveal
+    const io = new IntersectionObserver((entries) => {
+      entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+  </script>
+</body>
+</html>
