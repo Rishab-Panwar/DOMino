@@ -1,0 +1,586 @@
+/**
+ * Agent reasoning loop — executes Nova-generated action plans one step at a
+ * time, re-observing the page between each action.
+ *
+ * Extracted from service-worker.ts as a pure-refactor.
+ */
+
+import { DomSnapshot } from '../shared/types';
+import { captureScreenshot } from './screenshot';
+import { sendTaskContinue, TaskResponse, ActionHistoryEntry } from './api/backend-client';
+
+// Re-export for convenience
+export type { ActionHistoryEntry } from './api/backend-client';
+
+const MAX_AGENT_ITERATIONS = 25;
+
+// ─── Debug Logger ───
+
+const DEBUG_LOG: string[] = [];
+
+/** Send a log entry to the backend debug endpoint (fire-and-forget) */
+function sendToDebugEndpoint(message: string, level: string = 'info'): void {
+  fetch('http://localhost:8000/debug', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: 'extension', level, message }),
+  }).catch(() => { /* backend might be down — ignore */ });
+}
+
+function dbg(msg: string): void {
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const line = `[${ts}] ${msg}`;
+  DEBUG_LOG.push(line);
+  console.log(`[DOMino][DBG] ${line}`);
+  // Send actual errors to backend debug log (not lines that just contain "error=none")
+  const lower = msg.toLowerCase();
+  const isActualError = (lower.includes('error') || lower.includes('fail'))
+    && !lower.includes('error=none') && !lower.includes('non-fatal');
+  if (isActualError) {
+    sendToDebugEndpoint(line, 'error');
+  }
+}
+
+function dbgTimer(label: string): () => string {
+  const start = performance.now();
+  return () => {
+    const ms = Math.round(performance.now() - start);
+    const result = `${label} (${ms}ms)`;
+    dbg(result);
+    return result;
+  };
+}
+
+/** Get the full debug log as a string (for copying from console) */
+export function getDebugLog(): string {
+  return DEBUG_LOG.join('\n');
+}
+
+/** Clear the debug log (called at the start of a new pipeline run) */
+export function clearDebugLog(): void {
+  DEBUG_LOG.length = 0;
+}
+
+/** Write a debug line (exposed so the pipeline orchestrator can log too) */
+export { dbg, dbgTimer };
+
+// Expose globally for console access
+(globalThis as Record<string, unknown>).__dominoDebugLog = getDebugLog;
+
+// ─── Helpers ───
+
+function sendToTab(tabId: number, message: object): void {
+  chrome.tabs.sendMessage(tabId, message).catch(() => {
+    // Content script may not be loaded in this tab — ignore
+  });
+}
+
+/** Convert an action result to a short 3-7 word TTS phrase */
+export function shortSpeak(result: string): string {
+  if (result.startsWith('Navigating to')) return 'Going to ' + result.replace('Navigating to https://www.', '').replace('Navigating to https://', '').split('/')[0];
+  if (result.startsWith('Navigated to')) return 'Opened ' + result.replace('Navigated to https://www.', '').replace('Navigated to https://', '').split('/')[0];
+  if (result.startsWith("Typed '")) {
+    const match = result.match(/Typed '([^']+)'/);
+    return match ? `Searching ${match[1].slice(0, 20)}` : 'Typing';
+  }
+  if (result.startsWith("Clicked '#add-to-cart") || result.includes('Add to Cart') || result.includes('Add to cart')) return 'Added to cart';
+  if (result.startsWith("Clicked '")) {
+    const match = result.match(/Clicked '([^']+)'/);
+    const label = match ? match[1].slice(0, 25) : 'element';
+    return `Clicking ${label}`;
+  }
+  if (result.startsWith('Scrolled')) return 'Scrolling';
+  if (result.startsWith('Extracted')) return 'Reading text';
+  if (result.includes('navigated')) return 'Page loaded';
+  return result.slice(0, 30);
+}
+
+function sendAgentDone(tabId: number, actionHistory: ActionHistoryEntry[], label?: string): void {
+  if (actionHistory.length > 0) {
+    const stepSummaries = actionHistory.map(a => a.result || a.description);
+    sendToTab(tabId, { action: 'bubble-done-summary', steps: stepSummaries });
+
+    // Speak "All done" when task completes
+    if (label !== 'Cancelled') {
+      sendToTab(tabId, { action: 'tts-summary', summary: 'All done.' });
+    }
+  }
+  sendToTab(tabId, { action: 'bubble-state', state: 'done', label });
+  dbg(`=== AGENT DONE === steps=${actionHistory.length} label=${label || 'complete'}`);
+  dbg(`Full log:\n${getDebugLog()}`);
+}
+
+export async function waitForDomStable(tabId: number, timeout = 2000, settleMs = 300): Promise<boolean> {
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, {
+      action: 'wait-for-dom-stable',
+      timeout,
+      settleMs,
+    });
+    return result?.stable ?? false;
+  } catch {
+    // Content script unreachable — page may have navigated
+    return false;
+  }
+}
+
+/** Wait until DOM scrape returns meaningful content (buttons/inputs/links > 0) */
+export async function waitForDomContent(tabId: number, maxWaitMs = 8000): Promise<Partial<DomSnapshot>> {
+  const start = Date.now();
+  let lastSnapshot: Partial<DomSnapshot> = {};
+  let attempt = 0;
+
+  while (Date.now() - start < maxWaitMs) {
+    attempt++;
+    try {
+      const domResponse = await chrome.tabs.sendMessage(tabId, { action: 'scrape-dom' });
+      dbg(`waitForDomContent[${attempt}]: raw response ok=${domResponse?.ok} hasSnapshot=${!!domResponse?.snapshot} type=${typeof domResponse} keys=${domResponse?.snapshot ? Object.keys(domResponse.snapshot).length : 'N/A'} error=${domResponse?.error || 'none'}`);
+      if (domResponse?.ok && domResponse.snapshot) {
+        const snap = domResponse.snapshot;
+        const bCount = snap.buttons?.length || 0;
+        const iCount = snap.inputs?.length || 0;
+        const lCount = snap.links?.length || 0;
+        dbg(`waitForDomContent[${attempt}]: buttons=${bCount} inputs=${iCount} links=${lCount} url=${snap.url || 'none'}`);
+        if (bCount > 0 || iCount > 0 || lCount > 5) {
+          dbg(`waitForDomContent: found content after ${Date.now() - start}ms`);
+          return snap;
+        }
+        lastSnapshot = snap;
+      } else if (domResponse && !domResponse.ok) {
+        dbg(`waitForDomContent[${attempt}]: scrape FAILED: ${domResponse.error}`);
+      } else {
+        dbg(`waitForDomContent[${attempt}]: unexpected response: ${JSON.stringify(domResponse)?.slice(0, 200)}`);
+      }
+    } catch (err) {
+      dbg(`waitForDomContent[${attempt}]: sendMessage threw: ${err}`);
+    }
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  dbg(`waitForDomContent: timed out after ${maxWaitMs}ms (${attempt} attempts) — using last snapshot with keys=${Object.keys(lastSnapshot).length}`);
+  return lastSnapshot;
+}
+
+// ─── Agent Loop Context ───
+
+/** Mutable state shared between the orchestrator and the agent loop. */
+export interface AgentLoopState {
+  agentLoopCancelled: boolean;
+  agentLoopRunning: boolean;
+  agentLoopTabId: number | null;
+  firecrawlMarkdown?: string;
+  conversationHistory?: Array<{ role: string; content: string }>;
+  onAwaitReply?: () => void;
+}
+
+/** Classify a Nova response to determine the appropriate handling path. */
+export function classifyResponse(response: TaskResponse): 'action' | 'speak' | 'clarify' | 'options' | 'suggest' | 'done' {
+  if (response.needs_clarification) return 'clarify';
+  if (response.options?.length) return 'options';
+  if (response.suggestion && response.requires_confirmation) return 'suggest';
+  if (response.speak && !response.actions?.length) return 'speak';
+  if (response.type === 'done') return 'done';
+  return 'action';
+}
+
+// ─── Single-step execution ───
+
+type Step = NonNullable<TaskResponse['actions']>[number];
+
+/**
+ * Execute one action against the page and record the outcome.
+ * Returns:
+ *  - fatal: the whole loop should stop (lost page / failed navigation)
+ *  - ok: the action succeeded
+ *  - navigated: the action changed the page (so the batch must re-observe)
+ */
+async function executeStep(
+  tabId: number,
+  step: Step,
+  actionHistory: ActionHistoryEntry[],
+  originalCommand: string,
+): Promise<{ fatal: boolean; ok: boolean; navigated: boolean }> {
+  dbg(`Action: ${step.action} — "${step.description}" selector=${step.selector || 'none'} index=${step.index ?? 'none'}`);
+  sendToTab(tabId, {
+    action: 'bubble-step',
+    stepName: step.description,
+    stepIndex: actionHistory.length + 1,
+    totalSteps: 0,
+  });
+
+  const endActionTimer = dbgTimer(`Execute: ${step.action} "${step.description}"`);
+  let result: { ok: boolean; summary: string; error?: string } | null = null;
+  try {
+    result = await chrome.tabs.sendMessage(tabId, {
+      action: 'execute-action',
+      actionType: step.action,
+      index: step.index,
+      selector: step.selector,
+      value: step.value,
+      url: step.url,
+      direction: step.direction,
+      description: step.description,
+    });
+  } catch {
+    // Content script destroyed by navigation — wait for the new page.
+    dbg('Content script unreachable — waiting for page reload...');
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      await chrome.tabs.sendMessage(tabId, { action: 'scrape-dom' });
+      actionHistory.push({ description: step.description, result: 'Page navigated (action triggered navigation)' });
+      sendToTab(tabId, { action: 'bubble-set-task', task: originalCommand });
+      sendToTab(tabId, { action: 'bubble-state', state: 'executing' });
+      return { fatal: false, ok: true, navigated: true };
+    } catch {
+      sendToTab(tabId, { action: 'pipeline-error', error: 'Lost connection to page after navigation' });
+      return { fatal: true, ok: false, navigated: true };
+    }
+  }
+
+  if (!result) {
+    return { fatal: false, ok: false, navigated: false };
+  }
+
+  endActionTimer();
+  dbg(`Result: ok=${result.ok} summary="${result.summary}" error=${result.error || 'none'}`);
+
+  if (!result.ok) {
+    dbg(`ACTION FAILED: ${result.error} — will retry with fresh DOM`);
+    sendToTab(tabId, {
+      action: 'bubble-step',
+      stepName: `Failed: ${(result.error || 'Unknown').slice(0, 50)} — retrying...`,
+      stepIndex: actionHistory.length + 1,
+      totalSteps: 0,
+    });
+    actionHistory.push({
+      description: step.description,
+      result: `FAILED: ${result.error}. Try a different element or approach.`,
+    });
+    return { fatal: false, ok: false, navigated: false };
+  }
+
+  // Success — show result, speak short phrase, record.
+  sendToTab(tabId, {
+    action: 'bubble-step',
+    stepName: result.summary,
+    stepIndex: actionHistory.length + 1,
+    totalSteps: 0,
+  });
+  actionHistory.push({ description: step.description, result: result.summary });
+  const speakText = step.speak || shortSpeak(result.summary);
+  sendToTab(tabId, { action: 'tts-summary', summary: speakText });
+
+  // Navigate actions need special handling — wait for the new page to load.
+  if (step.action === 'navigate') {
+    dbg(`NAVIGATE: waiting for page to load... url=${step.url}`);
+    sendToTab(tabId, { action: 'bubble-state', state: 'understanding', label: 'Navigating...' });
+    const endNavTimer = dbgTimer('Navigate: page load');
+    await new Promise(r => setTimeout(r, 3000));
+    let pageReady = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await chrome.tabs.sendMessage(tabId, { action: 'scrape-dom' });
+        pageReady = true;
+        break;
+      } catch {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    if (!pageReady) {
+      dbg('NAVIGATE FAILED: page never loaded');
+      sendToTab(tabId, { action: 'pipeline-error', error: 'Page failed to load' });
+      return { fatal: true, ok: false, navigated: true };
+    }
+    endNavTimer();
+    sendToTab(tabId, { action: 'bubble-set-task', task: originalCommand });
+    sendToTab(tabId, { action: 'bubble-state', state: 'executing' });
+    sendToTab(tabId, { action: 'bubble-step', stepName: `Navigated to ${step.url}`, stepIndex: actionHistory.length, totalSteps: 0 });
+    dbg('Navigate complete. Waiting for page content...');
+    sendToTab(tabId, { action: 'bubble-state', state: 'understanding', label: 'Loading page content...' });
+    await waitForDomContent(tabId, 8000);
+    return { fatal: false, ok: true, navigated: true };
+  }
+
+  return { fatal: false, ok: true, navigated: false };
+}
+
+// ─── Agent Loop ───
+
+export async function runAgentLoop(
+  tabId: number,
+  originalCommand: string,
+  initialActions: TaskResponse['actions'],
+  state: AgentLoopState,
+): Promise<void> {
+  if (!initialActions || initialActions.length === 0) {
+    sendToTab(tabId, { action: 'bubble-state', state: 'done' });
+    return;
+  }
+
+  // Guard against concurrent agent loops
+  if (state.agentLoopRunning) {
+    console.warn('[DOMino][loop] Agent loop already running, skipping');
+    return;
+  }
+  state.agentLoopRunning = true;
+  state.agentLoopTabId = tabId;
+
+  try {
+  // Clear debug log for new run
+  DEBUG_LOG.length = 0;
+  dbg(`=== AGENT LOOP START === command="${originalCommand}" actions=${initialActions.length}`);
+  dbg(`Initial actions: ${JSON.stringify(initialActions.map(a => a.description))}`);
+
+  // Show the task in the bubble
+  sendToTab(tabId, { action: 'bubble-set-task', task: originalCommand });
+
+  // Transition bubble to executing state
+  sendToTab(tabId, { action: 'bubble-state', state: 'executing' });
+
+  const actionHistory: ActionHistoryEntry[] = [];
+  let currentActions = initialActions;
+  let iteration = 0;
+
+  // Reset cancel flag at start of each agent loop run
+  state.agentLoopCancelled = false;
+
+  while (iteration < MAX_AGENT_ITERATIONS) {
+    iteration++;
+    dbg(`--- Iteration ${iteration}/${MAX_AGENT_ITERATIONS} --- batch=${currentActions.length} actions`);
+
+    // Check for user cancellation at start of each outer iteration
+    if (state.agentLoopCancelled) {
+      state.agentLoopCancelled = false;
+      sendAgentDone(tabId, actionHistory, 'Cancelled');
+      return;
+    }
+
+    // Stop cleanly if the model returned no actions.
+    if (!currentActions[0]) {
+      dbg('No action to execute (empty step list) — ending loop');
+      sendAgentDone(tabId, actionHistory);
+      return;
+    }
+
+    // ─── Scoped batch execution ───
+    // Run consecutive "safe" actions (form fills that don't change which elements
+    // exist) from this plan back-to-back, then re-observe. Stop the batch after the
+    // first page-changing action (click/navigate/scroll) or any failure, because the
+    // indexed element list is only valid for the snapshot the model just saw.
+    // This cuts model round-trips (e.g. To+Subject+Body in one call instead of three).
+    const SAFE_TO_BATCH = new Set(['type', 'select', 'key', 'extract']);
+    const MAX_BATCH = 8;
+    let lastStep = currentActions[0];
+    for (let b = 0; b < currentActions.length && b < MAX_BATCH; b++) {
+      if (state.agentLoopCancelled) {
+        state.agentLoopCancelled = false;
+        sendAgentDone(tabId, actionHistory, 'Cancelled');
+        return;
+      }
+      lastStep = currentActions[b];
+      const outcome = await executeStep(tabId, lastStep, actionHistory, originalCommand);
+      if (outcome.fatal) return;
+      // Re-observe unless this was a safe, successful, non-navigating fill.
+      if (!outcome.ok || outcome.navigated || !SAFE_TO_BATCH.has(lastStep.action)) break;
+      // Safe fill succeeded — brief settle, then continue with the next batched action.
+      await waitForDomStable(tabId, 800, 150);
+    }
+
+    // Check for cancellation
+    if (state.agentLoopCancelled) {
+      state.agentLoopCancelled = false;
+      sendAgentDone(tabId, actionHistory, 'Cancelled');
+      return;
+    }
+
+    // Wait for DOM to settle after the batch
+    if (lastStep.action !== 'navigate') {
+      await waitForDomStable(tabId, 1500, 200);
+    }
+
+    // Re-observe the page with fresh DOM after every action
+    dbg('Re-observing page...');
+    const endSettleTimer = dbgTimer('DOM settle + content wait');
+    await waitForDomStable(tabId, 2000, 250);
+    endSettleTimer();
+
+    // Re-capture screenshot of the updated page
+    const endScreenTimer = dbgTimer('Screenshot capture');
+    let newScreenshot: string;
+    try {
+      newScreenshot = await captureScreenshot(tabId);
+    } catch {
+      // Re-observation failed — most often a click (e.g. a product link) triggered
+      // a navigation that destroyed the content script. Don't quit: wait for the new
+      // page to load like a navigate action, then continue the loop.
+      dbg('Re-observation failed — page may be navigating after a click. Waiting for new page...');
+      sendToTab(tabId, { action: 'bubble-state', state: 'understanding', label: 'Loading page...' });
+      let recovered = false;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          await chrome.tabs.sendMessage(tabId, { action: 'scrape-dom' });
+          recovered = true;
+          break;
+        } catch {
+          // still navigating / content script not back yet
+        }
+      }
+      if (!recovered) {
+        dbg('Page never recovered after navigation — treating as done');
+        sendAgentDone(tabId, actionHistory);
+        return;
+      }
+      // New page is reachable again — let its content settle, then re-capture.
+      sendToTab(tabId, { action: 'bubble-set-task', task: originalCommand });
+      sendToTab(tabId, { action: 'bubble-state', state: 'executing' });
+      await waitForDomContent(tabId, 8000);
+      try {
+        newScreenshot = await captureScreenshot(tabId);
+      } catch {
+        dbg('Screenshot still failing after navigation recovery — treating as done');
+        sendAgentDone(tabId, actionHistory);
+        return;
+      }
+      actionHistory.push({ description: lastStep.description, result: 'Navigated to a new page (click opened it)' });
+    }
+
+    endScreenTimer();
+
+    // Re-scrape DOM — wait for meaningful content (handles AJAX-heavy pages)
+    const endDomTimer = dbgTimer('DOM content wait');
+    let domSnapshot: Partial<DomSnapshot> = {};
+    try {
+      domSnapshot = await waitForDomContent(tabId, 5000);
+    } catch {
+      dbg('WARNING: DOM content wait failed entirely');
+    }
+    endDomTimer();
+    const domKeys = domSnapshot ? Object.keys(domSnapshot) : [];
+    const domButtonCount = domSnapshot?.buttons?.length || 0;
+    const domInputCount = domSnapshot?.inputs?.length || 0;
+    const domLinkCount = domSnapshot?.links?.length || 0;
+    const domUrl = domSnapshot?.url || 'unknown';
+    dbg(`DOM snapshot: url=${domUrl} keys=${domKeys.length} buttons=${domButtonCount} inputs=${domInputCount} links=${domLinkCount}`);
+    if (domKeys.length === 0) {
+      dbg('WARNING: DOM snapshot is EMPTY — content script may have returned before page loaded');
+    }
+
+    // Show re-evaluation progress in the bubble
+    sendToTab(tabId, {
+      action: 'bubble-state',
+      state: 'understanding',
+      label: `Re-evaluating... (${iteration}/${MAX_AGENT_ITERATIONS})`,
+    });
+
+    // Ask Nova what to do next based on the updated page
+    const endNovaTimer = dbgTimer('Nova /task/continue call');
+    let continueResult: TaskResponse;
+    try {
+      continueResult = await sendTaskContinue(
+        originalCommand, actionHistory, newScreenshot, domSnapshot,
+        state.firecrawlMarkdown, state.conversationHistory,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Agent loop failed to continue';
+      sendToTab(tabId, { action: 'pipeline-error', error: msg });
+      return;
+    }
+
+    // Check for cancellation immediately after in-flight fetch returns
+    if (state.agentLoopCancelled) {
+      state.agentLoopCancelled = false;
+      sendAgentDone(tabId, actionHistory, 'Cancelled');
+      return;
+    }
+
+    endNovaTimer();
+    dbg(`Nova response: type=${continueResult.type} reasoning="${continueResult.reasoning || 'none'}" actions=${continueResult.actions?.length || 0}`);
+    if (continueResult.actions) {
+      dbg(`Next actions: ${JSON.stringify(continueResult.actions.map(a => a.description))}`);
+    }
+
+    // Send reasoning to bubble if present
+    if (continueResult.reasoning) {
+      sendToTab(tabId, { action: 'bubble-reasoning', text: continueResult.reasoning });
+    }
+
+    // Evaluate conversational responses before standard action handling
+    const responseClass = classifyResponse(continueResult);
+    if (responseClass === 'clarify') {
+      const question = continueResult.question || 'Could you clarify?';
+      sendToTab(tabId, { action: 'tts-summary', summary: question });
+      sendToTab(tabId, { action: 'bubble-state', state: 'done', label: question });
+      state.onAwaitReply?.();
+      return;
+    }
+    if (responseClass === 'options') {
+      const optionsText = continueResult.question
+        ? `${continueResult.question} ${continueResult.options!.join(', ')}`
+        : continueResult.options!.join(', ');
+      sendToTab(tabId, { action: 'tts-summary', summary: optionsText });
+      sendToTab(tabId, { action: 'bubble-state', state: 'done', label: optionsText });
+      state.onAwaitReply?.();
+      return;
+    }
+    if (responseClass === 'suggest') {
+      const suggestionText = continueResult.suggestion || 'I have a suggestion.';
+      sendToTab(tabId, { action: 'tts-summary', summary: suggestionText });
+      sendToTab(tabId, { action: 'bubble-state', state: 'done', label: suggestionText });
+      state.onAwaitReply?.();
+      return;
+    }
+    if (responseClass === 'speak') {
+      const speakText = continueResult.speak || '';
+      sendToTab(tabId, { action: 'tts-summary', summary: speakText });
+      sendAgentDone(tabId, actionHistory, speakText);
+      return;
+    }
+
+    // Evaluate Nova's response
+    if (continueResult.type === 'done') {
+      // Task complete — speak the model's summary if available
+      const doneSummary = continueResult.summary || 'All done.';
+      sendToTab(tabId, { action: 'tts-summary', summary: doneSummary });
+      sendAgentDone(tabId, actionHistory);
+      return;
+    }
+
+    if (continueResult.type === 'answer') {
+      // Model answered instead of acting (usually stuck, or genuinely answering a
+      // question). Surface the message and end the loop rather than looping/crashing.
+      const answerText = continueResult.text || continueResult.reasoning || '';
+      if (answerText) {
+        sendToTab(tabId, { action: 'bubble-reasoning', text: answerText });
+        sendToTab(tabId, { action: 'tts-summary', summary: answerText.slice(0, 1500) });
+      }
+      sendAgentDone(tabId, actionHistory, answerText.slice(0, 60) || undefined);
+      return;
+    }
+
+    if (continueResult.type === 'steps') {
+      if (!continueResult.actions || continueResult.actions.length === 0) {
+        // Empty steps — treat as done
+        sendAgentDone(tabId, actionHistory);
+        return;
+      }
+      // Continue the loop with the next batch of actions
+      currentActions = continueResult.actions;
+      sendToTab(tabId, { action: 'bubble-state', state: 'executing' });
+      continue;
+    }
+  }
+
+  // Max iterations reached without Nova signalling done
+  sendToTab(tabId, {
+    action: 'bubble-step',
+    stepName: `Reached maximum iterations (${MAX_AGENT_ITERATIONS})`,
+    stepIndex: actionHistory.length,
+    totalSteps: 0,
+  });
+  sendAgentDone(tabId, actionHistory);
+  } finally {
+    state.agentLoopRunning = false;
+    state.agentLoopTabId = null;
+  }
+}
