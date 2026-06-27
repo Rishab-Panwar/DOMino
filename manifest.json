@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "DOMino",
+  "version": "1.0.0",
+  "description": "Speak a command and DOMino operates your browser — clicks, types, navigates, and completes tasks. A chain of actions that fall into place.",
+  "permissions": ["activeTab", "tabs", "storage", "offscreen"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  }
+}
