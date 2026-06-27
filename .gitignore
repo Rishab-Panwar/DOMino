@@ -1,0 +1,32 @@
+node_modules/
+dist/
+.DS_Store
+*.env
+.env.*
+# Python virtual environments
+.venv/
+backend/.venv/
+venv/
+# Local tooling artifacts
+skills-lock.json
+!.env.example
+!backend/.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+node_modules/
+dist/
+src/global-hack.mp4
+src/global-hack-final.mp4
+*.mov
+landing/*.mov
+# Allow landing page demo videos (MP4 only, not .mov originals)
+!landing/ffn-demo.mp4
+!landing/2-nova.mp4
+.agents/
+.claude/
+# Service-account / credential keys — never commit
+backend/vertex-sa.json
+*-service-account*.json
+*.sa.json
