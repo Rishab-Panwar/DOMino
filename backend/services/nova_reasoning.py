@@ -1,0 +1,1050 @@
+import base64
+import io
+import json
+import os
+import re
+import threading
+import time
+
+import boto3
+import requests
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+from PIL import Image
+
+# Max chars for DOM snapshot JSON to stay under token limits
+DOM_SNAPSHOT_MAX_CHARS = 30000
+
+# ── Supported models ────────────────────────────────────────────────────────
+
+SUPPORTED_MODELS = {
+    "nova-lite": {
+        "model_id": "us.amazon.nova-lite-v1:0",
+        "max_tokens": 2048,
+        "provider": "bedrock",
+        "description": "Amazon Nova Lite, fastest, cheapest, good for simple tasks",
+    },
+    "nova-pro": {
+        "model_id": "us.amazon.nova-pro-v1:0",
+        "max_tokens": 4096,
+        "provider": "bedrock",
+        "description": "Amazon Nova Pro, better reasoning, still fast",
+    },
+    "claude-haiku": {
+        "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "max_tokens": 4096,
+        "provider": "bedrock",
+        "description": "Claude Haiku 4.5, best quality for browser agents, excellent vision",
+    },
+    "claude-sonnet": {
+        "model_id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "max_tokens": 4096,
+        "provider": "bedrock",
+        "description": "Claude Sonnet 4, highest quality reasoning, slower",
+    },
+    "gemini-flash": {
+        "model_id": "gemini-2.5-flash",
+        "max_tokens": 4096,
+        "provider": "gemini",
+        "description": "Google Gemini 2.5 Flash, strong vision; free tier ~10 req/min",
+    },
+    "gemini-flash-lite": {
+        "model_id": "gemini-2.5-flash-lite",
+        "max_tokens": 4096,
+        "provider": "gemini",
+        "description": "Gemini 2.5 Flash-Lite, free tier ~15 req/min, 1000/day",
+    },
+    "gemini-flash-2-lite": {
+        "model_id": "gemini-2.0-flash-lite",
+        "max_tokens": 4096,
+        "provider": "gemini",
+        "description": "Gemini 2.0 Flash-Lite, free tier ~30 req/min (best for agent loops)",
+    },
+    "gemini-pro": {
+        "model_id": "gemini-2.5-pro",
+        "max_tokens": 8192,
+        "provider": "gemini",
+        "description": "Google Gemini 2.5 Pro, highest quality reasoning + vision",
+    },
+    # ── Vertex AI (GCP), first-party Gemini, billed to GCP project credits ──
+    "vertex-gemini-flash": {
+        "model_id": "gemini-2.5-flash",
+        "max_tokens": 4096,
+        "provider": "vertex",
+        "vision": True,
+        "description": "Vertex AI Gemini 2.5 Flash, paid tier via GCP credits, no rate walls",
+    },
+    "vertex-gemini-pro": {
+        "model_id": "gemini-2.5-pro",
+        "max_tokens": 8192,
+        "provider": "vertex",
+        "vision": True,
+        "description": "Vertex AI Gemini 2.5 Pro, highest quality, via GCP credits",
+    },
+    "groq-llama-70b": {
+        "model_id": "llama-3.3-70b-versatile",
+        "max_tokens": 4096,
+        "provider": "groq",
+        "vision": False,
+        # Free Groq tier is 12k tokens/min, keep the payload small so a single
+        # request fits and several fit within a minute.
+        "max_dom_chars": 7000,
+        "max_firecrawl_chars": 3000,
+        "description": "Groq Llama 3.3 70B, strong reasoning + JSON, text-only (uses DOM+Firecrawl), free",
+    },
+    "groq-llama": {
+        "model_id": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "max_tokens": 4096,
+        "provider": "groq",
+        "vision": True,
+        "description": "Groq Llama 4 Scout, vision, very fast, but weaker instruction-following",
+    },
+    # ── OpenRouter (aggregator), one key, many models; free tier needs no card ──
+    "openrouter-gemini-free": {
+        "model_id": "google/gemini-2.0-flash-exp:free",
+        "max_tokens": 4096,
+        "provider": "openrouter",
+        "vision": True,
+        "max_dom_chars": 12000,
+        "max_firecrawl_chars": 6000,
+        "description": "OpenRouter: Gemini 2.0 Flash (free), vision, strong, separate quota",
+    },
+    "openrouter-deepseek-free": {
+        "model_id": "deepseek/deepseek-chat-v3-0324:free",
+        "max_tokens": 4096,
+        "provider": "openrouter",
+        "vision": False,
+        "max_dom_chars": 12000,
+        "max_firecrawl_chars": 6000,
+        "description": "OpenRouter: DeepSeek V3 (free), strong reasoning + JSON, text-only",
+    },
+    "openrouter-claude": {
+        "model_id": "anthropic/claude-3.5-sonnet",
+        "max_tokens": 4096,
+        "provider": "openrouter",
+        "vision": True,
+        "description": "OpenRouter: Claude 3.5 Sonnet (paid credits), best quality + vision",
+    },
+}
+
+DEFAULT_MODEL = "nova-lite"
+
+
+def get_active_model() -> dict:
+    """Get the active model configuration from environment or default."""
+    model_key = os.getenv("DOMINO_MODEL", DEFAULT_MODEL).lower().strip()
+    if model_key not in SUPPORTED_MODELS:
+        print(f"[nova_reasoning] Unknown model '{model_key}', falling back to {DEFAULT_MODEL}")
+        model_key = DEFAULT_MODEL
+    return SUPPORTED_MODELS[model_key]
+
+
+def get_model_id() -> str:
+    """Get the active Bedrock model ID."""
+    return get_active_model()["model_id"]
+
+
+def _payload_limits() -> tuple[int, int]:
+    """(dom_max_chars, firecrawl_max_chars) for the active model, small for
+    token-per-minute-limited models, generous otherwise."""
+    m = get_active_model()
+    return m.get("max_dom_chars", DOM_SNAPSHOT_MAX_CHARS), m.get("max_firecrawl_chars", 15000)
+
+
+# ── JSON extraction ─────────────────────────────────────────────────────────
+
+
+# Valid JSON escapes are: \" \\ \/ \b \f \n \r \t \uXXXX. Models (especially
+# weaker ones) sometimes emit invalid escapes like \| when trying to escape
+# markdown pipes, which makes json.loads() throw and breaks the whole response.
+_INVALID_ESCAPE_RE = re.compile(r'\\(?![\"\\/bfnrtu])')
+
+
+def _loads_lenient(snippet: str) -> dict | list | None:
+    """json.loads with a fallback that strips invalid backslash escapes."""
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        pass
+    # Retry after dropping invalid escapes (e.g. \| -> |, \( -> ()
+    repaired = _INVALID_ESCAPE_RE.sub('', snippet)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_json(text: str) -> dict | list | None:
+    """Extract JSON from LLM response, handling markdown code blocks and extra text."""
+    # Strategy 1: Direct parse
+    parsed = _loads_lenient(text.strip())
+    if parsed is not None:
+        return parsed
+
+    # Strategy 2: Extract from markdown code block
+    code_block = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+    if code_block:
+        parsed = _loads_lenient(code_block.group(1).strip())
+        if parsed is not None:
+            return parsed
+
+    # Strategy 3: Find the first complete JSON object { ... }
+    brace_start = text.find('{')
+    if brace_start != -1:
+        depth = 0
+        for i in range(brace_start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    parsed = _loads_lenient(text[brace_start:i + 1])
+                    if parsed is not None:
+                        return parsed
+                    break
+
+    # Strategy 4: Find JSON array [ ... ]
+    bracket_start = text.find('[')
+    if bracket_start != -1:
+        depth = 0
+        for i in range(bracket_start, len(text)):
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    parsed = _loads_lenient(text[bracket_start:i + 1])
+                    if parsed is not None:
+                        return parsed
+                    break
+
+    return None
+
+
+# ── Screenshot compression ──────────────────────────────────────────────────
+
+
+def _compress_screenshot(screenshot_base64: str, max_width: int = 1024) -> str:
+    """Downscale and compress screenshot to JPEG to reduce payload size."""
+    try:
+        img_bytes = base64.b64decode(screenshot_base64)
+        img = Image.open(io.BytesIO(img_bytes))
+        # Downscale if wider than max_width
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_size = (max_width, int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+        # Convert to JPEG with quality 80 for better vision model accuracy
+        img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        # If compression fails, return original
+        return screenshot_base64
+
+
+# ── DOM truncation ──────────────────────────────────────────────────────────
+
+
+def _truncate_dom(dom_snapshot: dict, has_firecrawl: bool = False, max_chars: int = DOM_SNAPSHOT_MAX_CHARS) -> dict:
+    """Truncate DOM snapshot to stay under a character budget (token-limited models).
+
+    When Firecrawl markdown is present, drops text_content entirely
+    since Firecrawl provides richer page text.
+    """
+    trimmed = dict(dom_snapshot)
+
+    # When the indexed interactiveElements list is present, it is the action
+    # surface, drop the redundant raw selector arrays to save tokens and steer
+    # the model to act by index rather than guessing selectors.
+    if trimmed.get("interactiveElements"):
+        for redundant in ("buttons", "links", "inputs", "forms"):
+            trimmed.pop(redundant, None)
+
+    # Drop text_content when Firecrawl provides richer page text
+    if has_firecrawl and "text_content" in trimmed:
+        trimmed["text_content"] = "(see Firecrawl markdown below)"
+
+    # Drop images array, the model can see them in the screenshot
+    if "images" in trimmed:
+        trimmed["images"] = trimmed["images"][:5]
+
+    if len(json.dumps(trimmed)) <= max_chars:
+        return trimmed
+
+    # Over budget, progressively trim, cheapest-to-lose first.
+    if "text_content" in trimmed and not has_firecrawl:
+        trimmed["text_content"] = trimmed["text_content"][:2000]
+
+    for field in ["tables", "lists", "headings", "sections", "products"]:
+        if len(json.dumps(trimmed)) <= max_chars:
+            break
+        if isinstance(trimmed.get(field), list):
+            trimmed[field] = trimmed[field][:3]
+
+    # The indexed element list is the most important field, shrink it last, by
+    # shortening labels then reducing count, until the whole payload fits.
+    ie = trimmed.get("interactiveElements")
+    if isinstance(ie, list) and len(json.dumps(trimmed)) > max_chars:
+        for el in ie:
+            if isinstance(el, dict) and isinstance(el.get("label"), str):
+                el["label"] = el["label"][:60]
+        for limit in (120, 90, 60, 45, 30, 20):
+            if len(json.dumps(trimmed)) <= max_chars:
+                break
+            trimmed["interactiveElements"] = ie[:limit]
+
+    return trimmed
+
+
+# ── Bedrock client (singleton) ──────────────────────────────────────────────
+
+_bedrock_client = None
+_bedrock_lock = threading.Lock()
+
+
+def _get_bedrock_client():
+    """Get or create a singleton Bedrock Runtime client."""
+    global _bedrock_client
+    if _bedrock_client is not None:
+        return _bedrock_client
+
+    with _bedrock_lock:
+        if _bedrock_client is not None:
+            return _bedrock_client
+
+        key = os.getenv("AWS_ACCESS_KEY_ID", "")
+        secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        placeholders = {"your-key-here", "your-aws-access-key", "your-aws-secret-key", ""}
+
+        if not key or key in placeholders or not secret or secret in placeholders:
+            raise ValueError(
+                "AWS credentials not configured, set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in backend/.env"
+            )
+
+        try:
+            bedrock_config = BotoConfig(
+                max_pool_connections=10,
+                retries={"max_attempts": 3, "mode": "adaptive"},
+                connect_timeout=5,
+                read_timeout=30,
+            )
+            _bedrock_client = boto3.client(
+                "bedrock-runtime",
+                region_name=os.getenv("AWS_REGION", "us-east-1"),
+                aws_access_key_id=key,
+                aws_secret_access_key=secret,
+                config=bedrock_config,
+            )
+            return _bedrock_client
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            raise ValueError(
+                "AWS credentials not configured, set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in backend/.env"
+            ) from e
+        except Exception as e:
+            raise ValueError(f"Failed to create Bedrock client: {e}") from e
+
+
+def _reset_bedrock_client():
+    """Reset the singleton client (used in tests)."""
+    global _bedrock_client
+    with _bedrock_lock:
+        _bedrock_client = None
+
+
+# ── System prompts ──────────────────────────────────────────────────────────
+
+CONTINUE_SYSTEM_PROMPT = """You are DOMino, a screen-aware AI execution agent in a Chrome extension.
+You are CONTINUING a multi-step task that is already in progress.
+
+CRITICAL: You MUST respond with a JSON action (type "steps" or "done"). NEVER respond with type "answer" to describe what you plan to do, instead, actually DO IT by returning the action. Do NOT explain your plan in text, execute it as a step.
+
+You receive FOUR or FIVE inputs:
+1. A screenshot of the user's current browser tab (AFTER the last action was taken)
+2. A DOM snapshot, includes "interactiveElements", a NUMBERED list of every actionable element (you act by index)
+3. The user's original command
+4. A numbered list of actions already completed
+5. (Optional) Full page content from Firecrawl, clean markdown of the ENTIRE page
+
+UNDERSTAND THE FULL PAGE:
+- Use the Firecrawl markdown to understand the COMPLETE page content, including below the fold.
+- The DOM snapshot includes ALL interactive elements, those with "inViewport": false need scrolling to reach.
+- For form filling: analyze all input fields, understand what data each needs, and fill them systematically.
+- If you need to reach an element below the fold, use a scroll action first.
+
+CRITICAL RULES:
+- Target elements ONLY by their "index" from the interactiveElements list. NEVER use or invent CSS selectors.
+- The DOM snapshot contains: interactiveElements[] (the numbered action surface), products[], headings[], text_content, url, title.
+- Each interactive element has an "index", "kind", "label", and "role", pick the index whose label matches your target.
+- Look at the NEW screenshot and DOM snapshot to determine what happened after the last action.
+- If the task appears complete, signal done. Do NOT continue unnecessarily.
+
+RESPONSE FORMAT, respond with ONE JSON object only, no markdown, no explanation:
+
+IMPORTANT: Always include a "reasoning" field explaining your assessment of the current page state and your decision.
+
+For TASK COMPLETE (the task appears to be done):
+{"type": "done", "reasoning": "The search results are now showing USB-C cables. The task is complete.", "summary": "Brief description of what was accomplished"}
+
+For MORE ACTIONS NEEDED (the task requires more steps):
+{"type": "steps", "reasoning": "Search results are loaded. I can see the cheapest option. I'll click on it.", "actions": [...]}
+
+⚠️ When type is "steps", the "actions" array MUST contain at least one real action object. NEVER return "actions": []. NEVER describe an action only in "reasoning", the action you describe MUST appear as an object inside "actions". If you intend to navigate, the "actions" array must literally contain {"action":"navigate","url":"...","description":"...","speak":"..."}.
+
+For COMMUNICATING SOMETHING (you need to tell the user something about what happened):
+{"type": "answer", "reasoning": "I can see the relevant information in the page content.", "text": "your message"}
+
+THE INTERACTIVE ELEMENTS LIST, how you target things:
+The DOM snapshot contains "interactiveElements": a NUMBERED list of every actionable element on the page. Each entry looks like:
+  {"index": 12, "kind": "button", "role": "add-to-cart", "label": "Add to Cart", "inViewport": true}
+You target an element by its "index" number, NOT by CSS selector. Use ONLY indices that appear in the CURRENT list. After every action you receive a FRESH list with NEW indices; never reuse an index from a previous step.
+
+SUPPORTED ACTIONS, every action MUST include a "speak" field (a 3-5 word phrase, e.g. "Adding to cart"):
+- click:    {"action": "click", "index": 12, "description": "Click Add to Cart", "speak": "Adding to cart"}
+- type:     {"action": "type", "index": 5, "value": "text to type", "description": "Type into the search box", "speak": "Searching"}
+- select:   {"action": "select", "index": 8, "value": "Option label", "description": "Choose an option", "speak": "Selecting"}
+- key:      {"action": "key", "value": "Enter", "description": "Press Enter to submit", "speak": "Submitting"}   (value: Enter | Tab | Escape | ArrowDown | ArrowUp | Backspace)
+- scroll:   {"action": "scroll", "direction": "down", "description": "Scroll down", "speak": "Scrolling"}   (use {"action":"scroll","index":N} to bring element N into view)
+- navigate: {"action": "navigate", "url": "https://...", "description": "Open a site", "speak": "Opening"}
+- extract:  {"action": "extract", "index": 3, "description": "Read text from an element", "speak": "Reading"}
+
+INTERACTION RULES:
+- Fill a text field with "type" + its index. For an AUTOCOMPLETE field (e.g. an email "To" field, a search box with suggestions), after typing send a "key" with value "Enter" to confirm the entry.
+- Submit a search: "type" the query into the search box, then "key" "Enter".
+- If the element you need is not in the list, "scroll" (down) to reveal more, then re-check the new list.
+- NEVER invent an index. If unsure which element, prefer ones with inViewport:true and a matching label.
+
+DECISION GUIDELINES:
+- BATCHING: You MAY return several actions at once ONLY when they all act on fields that already exist on the CURRENT page and don't change the layout, e.g. filling a form: type into [To], type into [Subject], type into [Body]. This is faster.
+- A page-CHANGING action (click, navigate, scroll) must be the LAST action in your list (or the only one), after it the page changes and your indices are stale, so you'll get a fresh DOM to continue from.
+- When unsure whether the next element exists yet, return just ONE action and wait for the fresh DOM.
+- Think about the user's FULL goal. Only signal "done" when ALL items/tasks in the request are complete.
+- NEVER signal "done" if there are still unfinished items. If the user asked for 3 products, you must add ALL 3 before signaling "done".
+- If search results are showing but the user wanted to click/select/add something → respond with "steps"
+- If an action FAILED (you'll see "FAILED:" in the history), try a DIFFERENT selector or approach.
+- Do NOT get stuck in loops, if the EXACT same action has been tried 3+ times, skip that item and move to the next one.
+- NEVER treat remaining items as "separate tasks." Complete EVERYTHING the user asked for in one session.
+
+PRACTICAL TIPS:
+- For "Add to Cart", pick the interactiveElement whose role is "add-to-cart" or whose label contains "Add to Cart".
+- For a product in search results, click the index of the product's title/link (match by the product name in its label).
+- After adding an item to cart, type the NEXT item into the search box and press "key" Enter. Don't scroll the cart page.
+
+MULTI-STEP TASK EXAMPLES:
+- "Add cheapest USB-C cable to cart" → search → find cheapest → click product → click Add to Cart → done
+- "Write an email to john about meeting" → click compose → type to field → type subject → type body → click send → done
+- "Find and open the first search result" → type query → click search → click first result → done
+
+NAVIGATION CONTEXT:
+- If a previous action was "Page navigated", you are now on a NEW page. Look at the current URL and DOM to understand where you are.
+- After navigation, continue with the next step of the user's goal (e.g., search for the product).
+- The DOM snapshot and screenshot now show the NEW page, not the old one."""
+
+SYSTEM_PROMPT = """You are DOMino, a screen-aware AI execution agent in a Chrome extension.
+
+CRITICAL: When the user wants you to DO something (click, type, search, navigate, add to cart, etc.), you MUST respond with type "steps" containing an action. NEVER respond with type "answer" to describe what you plan to do, actually DO IT. Only use type "answer" when the user asks a QUESTION about the page content (e.g., "what is the price?").
+
+You receive THREE or FOUR inputs:
+1. A screenshot of the user's current browser tab
+2. A DOM snapshot, includes "interactiveElements", a NUMBERED list of every actionable element (you act by index)
+3. A voice command from the user
+4. (Optional) Full page content from Firecrawl, clean markdown of the ENTIRE page including content below the fold
+
+CRITICAL, UNDERSTAND THE FULL PAGE FIRST:
+- You receive the FULL page content (via Firecrawl markdown), not just what's visible in the screenshot.
+- ALWAYS read and analyze the Firecrawl content to understand the ENTIRE page structure, forms, sections, content below the fold, etc.
+- The DOM snapshot shows ALL interactive elements on the page, including ones NOT visible in the screenshot (check the "inViewport" field).
+- Elements with "inViewport": false exist on the page but need scrolling to reach. You can still interact with them, scroll to them first, or use their selectors directly.
+
+FORM FILLING INTELLIGENCE:
+- When the user wants to fill a form, FIRST analyze ALL form fields from the DOM snapshot (inputs[], forms[]).
+- Identify what information is needed for each field (name, email, phone, address, etc.).
+- If the user hasn't provided all required information, ASK for the missing details using the "needs_clarification" response:
+  {"type": "answer", "reasoning": "The form has fields for name, email, and phone. The user only said to fill the form but didn't provide these details.", "needs_clarification": true, "question": "I can see the form needs your name, email, and phone number. Could you tell me these details?", "speak": "I need some info first"}
+- If the form is below the fold, scroll to it first, then analyze and fill it.
+- Fill forms field by field, one "type" action per field, using exact selectors.
+
+CRITICAL RULES:
+- Target elements ONLY by their "index" from the interactiveElements list. NEVER use or invent CSS selectors.
+- The DOM snapshot contains: interactiveElements[] (the numbered action surface), products[], headings[], text_content, url, title.
+- Each interactive element has an "index", "kind", "label", and "role", pick the index whose label matches your target.
+- If the user asks about content visible on the page or in the DOM or Firecrawl content, ALWAYS answer based on what you know. You have FULL knowledge of the page.
+- If the user wants to do something on a DIFFERENT website, use the navigate action to go there first.
+- You CAN navigate to any website. Use navigate action with the full URL.
+
+RESPONSE FORMAT, respond with ONE JSON object only, no markdown, no explanation:
+
+IMPORTANT: Always include a "reasoning" field in your JSON response with a 1-2 sentence explanation of your decision.
+
+For QUESTIONS (user asks about the page):
+{"type": "answer", "reasoning": "I can see the price displayed in the product details section", "text": "your answer"}
+
+For TASKS (user wants you to do something on the page):
+{"type": "steps", "reasoning": "I see a search box at the top of the page. I'll type the query and click search.", "actions": [...]}
+
+⚠️ When type is "steps", the "actions" array MUST contain at least one real action object. NEVER return "actions": []. NEVER describe an action only in "reasoning", every action you describe MUST appear as an object inside "actions". To go to another site (e.g. Gmail), the FIRST action must be {"action":"navigate","url":"https://mail.google.com","description":"Open Gmail","speak":"Opening Gmail"}.
+
+THE INTERACTIVE ELEMENTS LIST, how you target things:
+The DOM snapshot contains "interactiveElements": a NUMBERED list of every actionable element on the page. Each entry looks like:
+  {"index": 12, "kind": "button", "role": "add-to-cart", "label": "Add to Cart", "inViewport": true}
+You target an element by its "index" number, NOT by CSS selector. Use ONLY indices that appear in the CURRENT list. After every action you receive a FRESH list with NEW indices; never reuse an index from a previous step.
+
+SUPPORTED ACTIONS, every action MUST include a "speak" field (a 3-5 word phrase, e.g. "Adding to cart"):
+- click:    {"action": "click", "index": 12, "description": "Click Add to Cart", "speak": "Adding to cart"}
+- type:     {"action": "type", "index": 5, "value": "text to type", "description": "Type into the search box", "speak": "Searching"}
+- select:   {"action": "select", "index": 8, "value": "Option label", "description": "Choose an option", "speak": "Selecting"}
+- key:      {"action": "key", "value": "Enter", "description": "Press Enter to submit", "speak": "Submitting"}   (value: Enter | Tab | Escape | ArrowDown | ArrowUp | Backspace)
+- scroll:   {"action": "scroll", "direction": "down", "description": "Scroll down", "speak": "Scrolling"}   (use {"action":"scroll","index":N} to bring element N into view)
+- navigate: {"action": "navigate", "url": "https://...", "description": "Open a site", "speak": "Opening"}
+- extract:  {"action": "extract", "index": 3, "description": "Read text from an element", "speak": "Reading"}
+
+INTERACTION RULES:
+- Fill a text field with "type" + its index. For an AUTOCOMPLETE field (e.g. an email "To" field, a search box with suggestions), after typing send a "key" with value "Enter" to confirm the entry.
+- Submit a search: "type" the query into the search box, then "key" "Enter".
+- If the element you need is not in the list, "scroll" (down) to reveal more, then re-check the new list.
+- NEVER invent an index. If unsure which element, prefer ones with inViewport:true and a matching label.
+
+CRITICAL RULES:
+- BATCHING: You MAY return several actions at once when they all fill fields that already exist on the CURRENT page (e.g. type [To], type [Subject], type [Body]). Put any page-CHANGING action (click/navigate/scroll) LAST or alone, the page changes after it and your indices become stale, so you'll get a fresh DOM.
+- Always scroll commands MUST return type "steps" with a scroll action, NEVER return "done" or "answer" for scroll requests.
+- NEVER return "done" on the first call unless the task is literally already complete on the current page.
+- If a target element is below the fold (inViewport: false), scroll down to reach it first.
+- Be FAST and DECISIVE. One action, move forward.
+
+IMPORTANT: Always look at the DOM snapshot FIRST to find the right selector. The screenshot helps you understand what the user sees, but the DOM snapshot has the actual selectors you must use. The Firecrawl content gives you the full page context including text you can't see in the screenshot."""
+
+CONVERSATIONAL_ADDENDUM = """
+You may respond with JSON containing any of these action types:
+- {"action": "click", "index": N}, click the element with that index
+- {"action": "type", "index": N, "value": "..."}, type text into that element
+- {"action": "key", "value": "Enter"}, press a key (Enter/Tab/Escape)
+- {"action": "navigate", "url": "..."}, go to URL
+- {"action": "scroll", "direction": "..."}, scroll the page
+- {"speak": "..."}, speak a response to the user
+- {"needs_clarification": true, "question": "..."}, ask the user a question
+- {"options": [...], "question": "..."}, present choices
+- {"suggestion": "...", "requires_confirmation": true}, suggest an action
+"""
+
+INTENT_CLASSIFICATION = """
+When the user has an ongoing conversation, classify their intent:
+- "new_task": Starting a completely new request
+- "reply": Answering a question you asked
+- "follow_up": Asking about something related to current conversation
+- "correction": Correcting a misunderstanding
+- "interruption": Asking to stop or cancel
+
+Include your classification: {"intent": "<type>", ...rest of response}
+"""
+
+
+# ── Core LLM call ───────────────────────────────────────────────────────────
+
+
+def _gemini_retry_delay(resp, default: float) -> float:
+    """Parse the retryDelay (e.g. '7s') Gemini returns on a 429, capped to 30s."""
+    try:
+        details = resp.json().get("error", {}).get("details", [])
+        for d in details:
+            delay = d.get("retryDelay")
+            if isinstance(delay, str) and delay.endswith("s"):
+                return min(float(delay[:-1]), 30.0)
+    except Exception:
+        pass
+    return min(default, 30.0)
+
+
+def _call_gemini(system_prompt: str, user_content: list[dict]) -> str:
+    """Call Google Gemini via the Generative Language REST API (vision-capable).
+
+    Used when DOMINO_MODEL is a gemini-* model. No AWS/Bedrock involvement.
+    """
+    model = get_active_model()
+    model_id = model["model_id"]
+
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    placeholders = {"", "your-gemini-api-key", "your-key-here"}
+    if not api_key or api_key in placeholders:
+        raise ValueError("Gemini API key not configured, set GEMINI_API_KEY in backend/.env")
+
+    # Build Gemini-format parts (image inline_data wants base64 string, not raw bytes)
+    parts = []
+    for block in user_content:
+        if block.get("type") == "image":
+            parts.append({
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(block["bytes"]).decode(),
+                }
+            })
+        elif block.get("type") == "text":
+            parts.append({"text": block["text"]})
+
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"maxOutputTokens": model["max_tokens"], "temperature": 0.2},
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+
+    # The agent loop fires many calls in quick succession; the free Gemini tier
+    # rate-limits (HTTP 429). Retry with backoff so a rate limit doesn't fail the task.
+    resp = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                json=body,
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Gemini request failed: {e}") from e
+
+        if resp.status_code != 429:
+            break
+
+        if attempt < 3:
+            wait = _gemini_retry_delay(resp, default=(attempt + 1) * 6)
+            print(f"[nova_reasoning] Gemini rate-limited (429), retrying in {wait}s (attempt {attempt + 1}/3)")
+            time.sleep(wait)
+
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "no response"
+        body_text = resp.text[:300] if resp is not None else ""
+        if status == 429:
+            raise ValueError(
+                "Gemini rate limit / quota exceeded (HTTP 429). The free tier allows only "
+                "a few requests per minute, wait a minute, or enable billing on Google AI "
+                "Studio for higher limits."
+            )
+        raise ValueError(f"Gemini API error (HTTP {status}): {body_text}")
+
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        # Could be a safety block or empty candidate
+        raise ValueError(f"Gemini returned no usable text: {json.dumps(data)[:300]}") from e
+
+
+_vertex_creds = None
+
+
+def _vertex_access_token() -> str:
+    """Get a GCP OAuth access token from a service account file or ADC (gcloud)."""
+    global _vertex_creds
+    import google.auth
+    import google.auth.transport.requests
+    from google.oauth2 import service_account
+
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    if _vertex_creds is None:
+        sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if sa_path and os.path.exists(sa_path):
+            _vertex_creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+        else:
+            # Application Default Credentials, works after `gcloud auth application-default login`
+            _vertex_creds, _ = google.auth.default(scopes=scopes)
+    if not _vertex_creds.valid:
+        _vertex_creds.refresh(google.auth.transport.requests.Request())
+    return _vertex_creds.token
+
+
+def _call_vertex(system_prompt: str, user_content: list[dict]) -> str:
+    """Call Gemini on Vertex AI (GCP). First-party model, billed to GCP project credits."""
+    model = get_active_model()
+    model_id = model["model_id"]
+    project = os.getenv("VERTEX_PROJECT_ID", "")
+    location = os.getenv("VERTEX_LOCATION", "us-central1").strip()
+    if not project or project in {"", "your-project-id"}:
+        raise ValueError("Vertex project not configured, set VERTEX_PROJECT_ID in backend/.env")
+
+    supports_vision = model.get("vision", True)
+    parts = []
+    for block in user_content:
+        if block.get("type") == "image":
+            if not supports_vision:
+                continue
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(block["bytes"]).decode()}})
+        elif block.get("type") == "text":
+            parts.append({"text": block["text"]})
+
+    body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"maxOutputTokens": model["max_tokens"], "temperature": 0.2},
+    }
+
+    try:
+        token = _vertex_access_token()
+    except Exception as e:
+        raise ValueError(
+            "Vertex auth failed, set GOOGLE_APPLICATION_CREDENTIALS to a service-account "
+            f"JSON, or run 'gcloud auth application-default login'. ({e})"
+        ) from e
+
+    host = "aiplatform.googleapis.com" if location == "global" else f"{location}-aiplatform.googleapis.com"
+    url = f"https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model_id}:generateContent"
+
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=45,
+        )
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Vertex request failed: {e}") from e
+
+    if resp.status_code != 200:
+        raise ValueError(f"Vertex API error (HTTP {resp.status_code}): {resp.text[:300]}")
+
+    data = resp.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"Vertex returned no usable text: {json.dumps(data)[:300]}") from e
+
+
+def _call_openai_compatible(
+    system_prompt: str,
+    user_content: list[dict],
+    url: str,
+    api_key: str,
+    label: str,
+    extra_headers: dict | None = None,
+) -> str:
+    """Shared caller for OpenAI-compatible chat APIs (Groq, OpenRouter, etc.)."""
+    model = get_active_model()
+
+    # Text-only models (vision=False) skip the screenshot and reason from the DOM
+    # snapshot + Firecrawl markdown instead.
+    supports_vision = model.get("vision", True)
+    parts = []
+    for block in user_content:
+        if block.get("type") == "image":
+            if not supports_vision:
+                continue
+            b64 = base64.b64encode(block["bytes"]).decode()
+            parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        elif block.get("type") == "text":
+            parts.append({"type": "text", "text": block["text"]})
+
+    body = {
+        "model": model["model_id"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": parts},
+        ],
+        "max_tokens": model["max_tokens"],
+        "temperature": 0.2,
+    }
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    resp = None
+    for attempt in range(4):
+        try:
+            resp = requests.post(url, headers=headers, json=body, timeout=45)
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"{label} request failed: {e}") from e
+
+        if resp.status_code != 429:
+            break
+        if attempt < 3:
+            wait = (attempt + 1) * 5
+            m = re.search(r"try again in ([\d.]+)s", resp.text)
+            if m:
+                wait = min(float(m.group(1)) + 1.0, 30.0)
+            print(f"[nova_reasoning] {label} rate-limited (429), retrying in {wait:.1f}s (attempt {attempt + 1}/3)")
+            time.sleep(wait)
+
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "no response"
+        body_text = resp.text[:300] if resp is not None else ""
+        raise ValueError(f"{label} API error (HTTP {status}): {body_text}")
+
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"{label} returned no usable text: {json.dumps(data)[:300]}") from e
+
+
+def _call_groq(system_prompt: str, user_content: list[dict]) -> str:
+    """Call a Groq-hosted model via the OpenAI-compatible API (reuses GROQ_API_KEY)."""
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key or api_key in {"", "your-groq-api-key", "your-key-here"}:
+        raise ValueError("Groq API key not configured, set GROQ_API_KEY in backend/.env")
+    return _call_openai_compatible(
+        system_prompt, user_content,
+        "https://api.groq.com/openai/v1/chat/completions", api_key, "Groq",
+    )
+
+
+def _call_openrouter(system_prompt: str, user_content: list[dict]) -> str:
+    """Call a model via OpenRouter (aggregator). Free-tier models need no card."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    if not api_key or api_key in {"", "your-openrouter-api-key", "your-key-here"}:
+        raise ValueError("OpenRouter API key not configured, set OPENROUTER_API_KEY in backend/.env")
+    return _call_openai_compatible(
+        system_prompt, user_content,
+        "https://openrouter.ai/api/v1/chat/completions", api_key, "OpenRouter",
+        extra_headers={"HTTP-Referer": "http://localhost", "X-Title": "DOMino"},
+    )
+
+
+def _call_nova(system_prompt: str, user_content: list[dict]) -> str:
+    """Call the active AI model with vision support.
+
+    Routes to Google Gemini (REST) or AWS Bedrock converse depending on the
+    active model's provider. Model is selected via DOMINO_MODEL.
+    """
+    model = get_active_model()
+    if model.get("provider") == "gemini":
+        return _call_gemini(system_prompt, user_content)
+    if model.get("provider") == "groq":
+        return _call_groq(system_prompt, user_content)
+    if model.get("provider") == "openrouter":
+        return _call_openrouter(system_prompt, user_content)
+    if model.get("provider") == "vertex":
+        return _call_vertex(system_prompt, user_content)
+
+    client = _get_bedrock_client()
+    model_id = model["model_id"]
+
+    # Build Bedrock-format message content
+    bedrock_content = []
+    for block in user_content:
+        if block.get("type") == "image":
+            bedrock_content.append({
+                "image": {
+                    "format": "jpeg",
+                    "source": {"bytes": block["bytes"]},
+                }
+            })
+        elif block.get("type") == "text":
+            bedrock_content.append({
+                "text": block["text"],
+            })
+
+    try:
+        response = client.converse(
+            modelId=model_id,
+            system=[{"text": system_prompt}],
+            messages=[{"role": "user", "content": bedrock_content}],
+            inferenceConfig={"maxTokens": model["max_tokens"]},
+        )
+        response_text = response["output"]["message"]["content"][0]["text"]
+        return response_text
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        error_msg = e.response["Error"]["Message"]
+        if "AccessDenied" in error_code:
+            raise ValueError(f"Access denied, {error_msg} (check IAM permissions for Bedrock)") from e
+        raise ValueError(f"Bedrock API error ({error_code}): {error_msg}") from e
+    except (NoCredentialsError, PartialCredentialsError) as e:
+        raise ValueError(
+            "AWS credentials are invalid or incomplete, set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in backend/.env"
+        ) from e
+
+
+# ── Response normalization ──────────────────────────────────────────────────
+
+
+def _coerce_response(parsed, response_text: str, fallback_type: str) -> dict:
+    """Coerce a parsed model response into a {"type": ...} dict.
+
+    Models sometimes omit the "type" field (e.g. return {intent, reasoning, text}).
+    Infer the type from the fields present so we never leak the raw JSON to the UI.
+    """
+    if isinstance(parsed, list):
+        return {"type": "steps", "actions": parsed}
+
+    if isinstance(parsed, dict):
+        if "type" in parsed:
+            return parsed
+        if parsed.get("actions"):
+            return {**parsed, "type": "steps"}
+        if parsed.get("needs_clarification") or parsed.get("options") or parsed.get("suggestion"):
+            return {**parsed, "type": "answer"}
+        if "text" in parsed:
+            return {**parsed, "type": "answer"}
+        if "speak" in parsed:
+            return {**parsed, "type": "answer", "text": parsed.get("speak", "")}
+        if "summary" in parsed:
+            return {**parsed, "type": "done"}
+
+    # Unknown shape, wrap the raw text under the caller's fallback type.
+    key = "summary" if fallback_type == "done" else "text"
+    return {"type": fallback_type, key: response_text}
+
+
+# ── Public reasoning functions ──────────────────────────────────────────────
+
+
+def reason_about_page(
+    command: str,
+    screenshot_base64: str,
+    dom_snapshot: dict,
+    firecrawl_markdown: str | None = None,
+    conversation_history: list[dict] | None = None,
+) -> dict:
+    """Reason about the current page using an AI model via Bedrock.
+
+    Args:
+        command: The user's voice command text.
+        screenshot_base64: Base64-encoded PNG screenshot (raw base64, no data URI prefix).
+        dom_snapshot: Structured DOM data with interactive elements and their CSS selectors.
+        firecrawl_markdown: Clean page text extracted by Firecrawl (optional).
+        conversation_history: Prior conversation turns as list of {"role": ..., "content": ...} dicts (optional).
+
+    Returns:
+        A dict with either:
+        - {"type": "answer", "text": "..."} for questions
+        - {"type": "steps", "actions": [...]} for task commands
+    """
+    # Validate screenshot before processing
+    try:
+        base64.b64decode(screenshot_base64)
+    except Exception:
+        raise ValueError("Invalid screenshot: could not decode base64 data")
+
+    compressed = _compress_screenshot(screenshot_base64)
+    screenshot_bytes = base64.b64decode(compressed)
+
+    conversation_preamble = ""
+    if conversation_history:
+        turns = "\n".join(
+            f"{'User' if t['role'] == 'user' else 'Agent'}: {t['content']}"
+            for t in conversation_history
+        )
+        conversation_preamble = f"\nConversation so far:\n{turns}\n"
+
+    dom_max, fc_max = _payload_limits()
+    firecrawl_block = ""
+    if firecrawl_markdown:
+        firecrawl_block = f"\nPage content (via Firecrawl):\n{firecrawl_markdown[:fc_max]}\n"
+
+    user_content = [
+        {"type": "image", "bytes": screenshot_bytes},
+        {"type": "text", "text": f"DOM Snapshot:\n{json.dumps(_truncate_dom(dom_snapshot, has_firecrawl=bool(firecrawl_markdown), max_chars=dom_max))}"},
+    ]
+
+    if firecrawl_block:
+        user_content.append({"type": "text", "text": firecrawl_block})
+
+    if conversation_preamble:
+        user_content.append({"type": "text", "text": conversation_preamble})
+
+    user_content.append({"type": "text", "text": f"User command: {command}"})
+
+    system_prompt = SYSTEM_PROMPT + CONVERSATIONAL_ADDENDUM
+    if conversation_history:
+        system_prompt += INTENT_CLASSIFICATION
+
+    try:
+        response_text = _call_nova(system_prompt, user_content)
+
+        parsed = _extract_json(response_text)
+        if parsed is not None:
+            return _coerce_response(parsed, response_text, "answer")
+        return {"type": "answer", "text": response_text}
+
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Reasoning failed: {e}") from e
+
+
+def reason_continue(
+    original_command: str,
+    action_history: list[dict],
+    screenshot_base64: str,
+    dom_snapshot: dict,
+    firecrawl_markdown: str | None = None,
+    conversation_history: list[dict] | None = None,
+) -> dict:
+    """Continue reasoning about a multi-step task after actions have been taken."""
+    # Validate screenshot before processing
+    try:
+        base64.b64decode(screenshot_base64)
+    except Exception:
+        raise ValueError("Invalid screenshot: could not decode base64 data")
+
+    # Compress action history for long chains
+    if len(action_history) > 5:
+        older = action_history[:-3]
+        recent = action_history[-3:]
+        older_summary = f"Previously completed {len(older)} actions: " + ", ".join(
+            entry.get('description', 'Unknown')[:40] for entry in older
+        )
+        formatted_history = older_summary + "\n\nRecent actions:\n" + "\n".join(
+            f"{len(older) + i + 1}. {entry.get('description', 'Unknown action')} -> {entry.get('result', 'Unknown result')}"
+            for i, entry in enumerate(recent)
+        )
+    elif action_history:
+        formatted_history = "\n".join(
+            f"{i + 1}. {entry.get('description', 'Unknown action')} -> {entry.get('result', 'Unknown result')}"
+            for i, entry in enumerate(action_history)
+        )
+    else:
+        formatted_history = "(no actions taken yet)"
+
+    conversation_preamble = ""
+    if conversation_history:
+        turns = "\n".join(
+            f"{'User' if t['role'] == 'user' else 'Agent'}: {t['content']}"
+            for t in conversation_history
+        )
+        conversation_preamble = f"\nConversation so far:\n{turns}\n"
+
+    dom_max, fc_max = _payload_limits()
+    firecrawl_block = ""
+    if firecrawl_markdown:
+        firecrawl_block = f"\nPage content (via Firecrawl):\n{firecrawl_markdown[:fc_max]}\n"
+
+    compressed = _compress_screenshot(screenshot_base64)
+    screenshot_bytes = base64.b64decode(compressed)
+
+    user_content = [
+        {"type": "image", "bytes": screenshot_bytes},
+        {"type": "text", "text": f"DOM Snapshot:\n{json.dumps(_truncate_dom(dom_snapshot, has_firecrawl=bool(firecrawl_markdown), max_chars=dom_max))}"},
+    ]
+
+    if firecrawl_block:
+        user_content.append({"type": "text", "text": firecrawl_block})
+
+    if conversation_preamble:
+        user_content.append({"type": "text", "text": conversation_preamble})
+
+    user_content.append({
+        "type": "text",
+        "text": (
+            f"Original command: {original_command}\n\n"
+            f"Actions completed so far:\n{formatted_history}\n\n"
+            f"What should I do next? If the task is complete, respond with type 'done'."
+        ),
+    })
+
+    system_prompt = CONTINUE_SYSTEM_PROMPT + CONVERSATIONAL_ADDENDUM
+    if conversation_history:
+        system_prompt += INTENT_CLASSIFICATION
+
+    try:
+        response_text = _call_nova(system_prompt, user_content)
+
+        parsed = _extract_json(response_text)
+        if parsed is not None:
+            return _coerce_response(parsed, response_text, "done")
+        return {"type": "done", "summary": response_text}
+
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Continue reasoning failed: {e}") from e
