@@ -1,0 +1,38 @@
+import { getSupportedMimeType, getMimeExtension } from '../shared/mime-utils';
+
+describe('mime-utils', () => {
+  test('getMimeExtension returns correct extension for known types', () => {
+    expect(getMimeExtension('audio/webm;codecs=opus')).toBe('webm');
+    expect(getMimeExtension('audio/webm')).toBe('webm');
+    expect(getMimeExtension('audio/ogg;codecs=opus')).toBe('ogg');
+    expect(getMimeExtension('audio/mp4')).toBe('mp4');
+    expect(getMimeExtension('audio/wav')).toBe('wav');
+  });
+
+  test('getMimeExtension returns webm for unknown types', () => {
+    expect(getMimeExtension('audio/unknown')).toBe('webm');
+  });
+
+  test('getSupportedMimeType returns a string', () => {
+    const result = getSupportedMimeType();
+    expect(typeof result).toBe('string');
+  });
+
+  test('getSupportedMimeType returns first supported MIME type', () => {
+    const orig = (global as any).MediaRecorder;
+    (global as any).MediaRecorder = {
+      isTypeSupported: (mime: string) => mime === 'audio/ogg;codecs=opus',
+    };
+    expect(getSupportedMimeType()).toBe('audio/ogg;codecs=opus');
+    (global as any).MediaRecorder = orig;
+  });
+
+  test('getSupportedMimeType returns fallback when nothing supported', () => {
+    const orig = (global as any).MediaRecorder;
+    (global as any).MediaRecorder = {
+      isTypeSupported: () => false,
+    };
+    expect(getSupportedMimeType()).toBe('audio/webm');
+    (global as any).MediaRecorder = orig;
+  });
+});
