@@ -18,7 +18,6 @@
 </p>
 
 ---
-<img width="1536" height="1024" alt="domino theme" src="https://github.com/user-attachments/assets/a90c2e69-c893-4741-91cc-d6101ab1d50c" />
 
 ## What is DOMino?
 
