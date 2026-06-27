@@ -1,0 +1,164 @@
+/**
+ * Text-to-Speech module using ElevenLabs API.
+ * Falls back to Web Speech API if no API key is configured.
+ */
+import { getApiKeys, getSettings } from '../shared/storage';
+import { DEFAULT_VOICE_ID, DEFAULT_TTS_MODEL } from '../shared/constants';
+
+let enabled = true;
+let currentAudio: HTMLAudioElement | null = null;
+let currentUtterance: SpeechSynthesisUtterance | null = null;
+let onInterruptCallback: (() => void) | null = null;
+
+export function setTtsEnabled(value: boolean): void {
+  enabled = value;
+  if (!value) stop();
+}
+
+export function isTtsEnabled(): boolean {
+  return enabled;
+}
+
+/** Read voice settings dynamically from user settings */
+async function getVoiceConfig(): Promise<{ voiceId: string; model: string }> {
+  const settings = await getSettings();
+  return {
+    voiceId: settings.voiceId || DEFAULT_VOICE_ID,
+    model: settings.ttsModel || DEFAULT_TTS_MODEL,
+  };
+}
+
+/** Strip markdown for cleaner speech */
+function cleanForSpeech(text: string): string {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^- /gm, '')
+    .replace(/#{1,6}\s*/g, '');
+}
+
+/** ElevenLabs TTS — routes through service worker to avoid page CSP blocking */
+async function speakElevenLabs(text: string, apiKey: string): Promise<void> {
+  const clean = cleanForSpeech(text);
+  const { voiceId, model } = await getVoiceConfig();
+
+  try {
+    // Send to service worker which has unrestricted network access
+    const response: { ok: boolean; audioBase64?: string; error?: string } = await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        {
+          action: 'elevenlabs-tts',
+          text: clean,
+          apiKey,
+          voiceId,
+          modelId: model,
+        },
+        (resp) => resolve(resp || { ok: false, error: 'No response' })
+      );
+    });
+
+    if (!response.ok || !response.audioBase64) {
+      console.warn('[DOMino] ElevenLabs TTS failed via SW:', response.error, '— falling back to Web Speech');
+      console.log('[DOMino] TTS provider used: Web Speech (browser fallback) ⚠️');
+      speakWebSpeech(text);
+      return;
+    }
+
+    console.log(`[DOMino] TTS provider used: ElevenLabs ✅ (voiceId=${voiceId})`);
+
+    // Convert base64 to audio blob and play
+    const binaryString = atob(response.audioBase64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const audioBlob = new Blob([bytes], { type: 'audio/mpeg' });
+    const audioUrl = URL.createObjectURL(audioBlob);
+
+    currentAudio = new Audio(audioUrl);
+    currentAudio.addEventListener('ended', () => {
+      URL.revokeObjectURL(audioUrl);
+      currentAudio = null;
+      chrome.runtime.sendMessage({ action: 'tts-playback-finished' })
+        .catch(err => console.error('[DOMino] tts-finished send:', err));
+    });
+    currentAudio.play().catch(err => console.warn('[DOMino][TTS] play() rejected:', err));
+  } catch (err) {
+    console.warn('[DOMino] ElevenLabs TTS error:', err);
+    speakWebSpeech(text);
+  }
+}
+
+/** Web Speech API fallback */
+function speakWebSpeech(text: string): void {
+  const clean = cleanForSpeech(text);
+  const utterance = new SpeechSynthesisUtterance(clean);
+  utterance.rate = 1.05;
+  utterance.pitch = 1.0;
+  utterance.volume = 1.0;
+
+  const voices = speechSynthesis.getVoices();
+  const preferred = voices.find(
+    (v) => v.name.includes('Samantha') || v.name.includes('Google US English') || v.name.includes('Daniel')
+  );
+  if (preferred) utterance.voice = preferred;
+
+  utterance.addEventListener('end', () => {
+    currentUtterance = null;
+    chrome.runtime.sendMessage({ action: 'tts-playback-finished' })
+      .catch(err => console.error('[DOMino] tts-finished send:', err));
+  });
+
+  currentUtterance = utterance;
+  speechSynthesis.speak(utterance);
+}
+
+export async function speak(text: string): Promise<void> {
+  console.log('[DOMino][TTS] speak() called, enabled:', enabled, 'text:', text.substring(0, 80));
+  if (!enabled) return;
+  stop();
+
+  try {
+    const keys = await getApiKeys();
+    console.log('[DOMino][TTS] API keys loaded, hasElevenLabsKey:', !!keys.elevenLabsKey);
+    if (keys.elevenLabsKey) {
+      await speakElevenLabs(text, keys.elevenLabsKey);
+    } else {
+      console.log('[DOMino][TTS] No ElevenLabs key, falling back to Web Speech API');
+      console.log('[DOMino] TTS provider used: Web Speech (browser fallback) ⚠️');
+      speakWebSpeech(text);
+    }
+  } catch (err) {
+    console.warn('[DOMino] TTS error:', err);
+    // Last resort fallback
+    try { speakWebSpeech(text); } catch { /* silent */ }
+  }
+}
+
+export function stop(): void {
+  // Stop ElevenLabs audio
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+    currentAudio = null;
+  }
+  // Stop Web Speech
+  speechSynthesis.cancel();
+  currentUtterance = null;
+}
+
+export function isSpeaking(): boolean {
+  return !!(currentAudio && !currentAudio.paused) || speechSynthesis.speaking;
+}
+
+export function onInterrupt(cb: () => void): void {
+  onInterruptCallback = cb;
+}
+
+export function interrupt(): void {
+  if (isSpeaking()) {
+    stop();
+    onInterruptCallback?.();
+  }
+}
