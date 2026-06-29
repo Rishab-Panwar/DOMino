@@ -18,8 +18,6 @@
 </p>
 
 ---
-<img width="1891" height="958" alt="ezgif com-animated-gif-maker (1)" src="https://github.com/user-attachments/assets/ee03955b-a37d-4ae8-8a50-fed159aed6f7" />
-
 
 ## What is DOMino?
 
@@ -34,6 +32,9 @@ It is **not** scripted for specific sites. Because it acts on the page's own DOM
 > **Runs 100% locally.** Everything runs on your own machine: a local FastAPI backend plus the extension loaded in your browser. Your API keys and data never leave your computer. There is no hosted service; the website is just a showcase.
 
 ---
+
+<img width="1891" height="958" alt="ezgif com-animated-gif-maker (2)" src="https://github.com/user-attachments/assets/7afc2f2b-fca7-46e0-ac0d-5c5191e9dc63" />
+
 
 ## How it works
 
