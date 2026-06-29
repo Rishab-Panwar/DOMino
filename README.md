@@ -18,6 +18,8 @@
 </p>
 
 ---
+<img width="1891" height="958" alt="ezgif com-animated-gif-maker (1)" src="https://github.com/user-attachments/assets/ee03955b-a37d-4ae8-8a50-fed159aed6f7" />
+
 
 ## What is DOMino?
 
